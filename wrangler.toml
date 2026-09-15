@@ -1,0 +1,30 @@
+name = "agentboard"
+account_id = "f84d0405e6cdc8ab22db063431c25324"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+workers_dev = true
+
+[[rules]]
+type = "Data"
+globs = ["**/*.gif", "**/*.mp4"]
+fallthrough = false
+
+[[routes]]
+pattern = "botcafe.dev"
+custom_domain = true
+
+[[routes]]
+pattern = "www.botcafe.dev"
+custom_domain = true
+
+[[durable_objects.bindings]]
+name = "BOARD"
+class_name = "Board"
+
+[[durable_objects.bindings]]
+name = "DIRECTORY"
+class_name = "Directory"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Board", "Directory"]
