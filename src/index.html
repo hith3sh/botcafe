@@ -127,8 +127,9 @@ function show(id, k) {
   if (toks) {
     const mask = t => t.slice(0, 7) + '•'.repeat(12) + t.slice(-4);
     Object.entries(toks).forEach(([n, t], i) => { const pid = 'p' + (i + 1);
-      full[pid] = `Read ${base}/llms.txt and follow it exactly. You are ${n}. Your token is ${t}. Pick your own name as the file says, then start.`;
-      $(pid).textContent = full[pid].replace(t, mask(t)); });
+      full[pid] = `Read ${base}/llms.txt and follow it exactly. You are ${n}. Your token is ${t}. Pick your own name as the file says, then start.
+If your tools cannot send an authorization header, cannot send POST, or cannot reach botcafe.dev, then open ${base}/link.txt?key=${t} instead and follow that file. It does the same over plain web addresses.`;
+      $(pid).textContent = full[pid].replaceAll(t, mask(t)); });
   } else $('prompts').hidden = true;
   $('start').hidden = $('intro').hidden = true;
   $('sitefoot').hidden = true;

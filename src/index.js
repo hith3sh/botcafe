@@ -3,11 +3,12 @@ import { DurableObject } from 'cloudflare:workers';
 import indexHtml from './index.html';
 import articleHtml from './article.html';
 import llmsTxt from './llms.txt';
+import linkTxt from './link.txt';
 import { ARTICLES, bySlug } from './articles.js';
 import demoGif from './static/demo.gif';
 import demoMp4 from './static/demo.mp4';
 
-const json = (b, s = 200) => new Response(JSON.stringify(b), { status: s, headers: { 'content-type': 'application/json' } });
+const json = (b, s = 200, extra = {}) => new Response(JSON.stringify(b), { status: s, headers: { 'content-type': 'application/json', ...extra } });
 const html = (h, extra = {}) => new Response(h, { headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache', ...extra } });
 const text = (b, type, extra = {}) => new Response(b, { headers: { 'content-type': type, 'cache-control': 'no-cache', ...extra } });
 const bin = (b, type) => new Response(b, { headers: { 'content-type': type, 'cache-control': 'public, max-age=86400' } });
@@ -18,7 +19,11 @@ const now = () => new Date().toISOString();
 const KINDS = ['working', 'waiting', 'blocked', 'done'];
 // ponytail: fixed caps; make them per-plan if paying users appear
 const LIMITS = { statusText: 200, text: 8000, msgsPerBoard: 2000, bytesPerBoard: 4e6, waitersPerBoard: 8, postsPerMin: 20,
-  registerPerIpPerHour: 10, convsPerUserPerDay: 20, emptyBoardDays: 7, listPage: 20 };
+  registerPerIpPerHour: 10, convsPerUserPerDay: 20, emptyBoardDays: 7, listPage: 20,
+  // the URL fallback: a GET-only channel for agents in a sandbox that cannot POST. Short text, because it travels in the address.
+  linkText: 2000, linkDedupeMs: 120e3, linkRead: 30 };
+const TOK = /^ag_[0-9a-f]{48}$/; // the agent token, as it appears inside an address
+const NOSTORE = { 'cache-control': 'no-store', 'x-robots-tag': 'noindex' }; // a link answer carries a key in the address: never store it
 const DAY = 864e5;
 const SITE = 'https://botcafe.dev';
 const DESC = 'Two AI agents share context on a live board at botcafe.dev. Make Claude talk to GPT or a local model — cloud or laptop — if they can run curl.';
@@ -107,15 +112,11 @@ async function handle(req, env) {
     const ip = req.headers.get('cf-connecting-ip') || '0';
 
     if (m === 'GET' && p === '/robots.txt') {
+      // Boards stay out of search through X-Robots-Tag: noindex on every /c/ response, not through Disallow.
+      // Disallow did not help there (a crawler that may not fetch a URL never reads its noindex header) and it did hurt:
+      // an agent whose only network tool is a robots-respecting fetcher was refused its own board.
       return text(`User-agent: *
 Allow: /
-Allow: /home
-Allow: /a/
-Allow: /demo.gif
-Allow: /demo.mp4
-Disallow: /c/
-Disallow: /conversations
-Disallow: /register
 Disallow: /admin/
 Sitemap: ${SITE}/sitemap.xml
 `, 'text/plain; charset=utf-8');
@@ -173,6 +174,10 @@ ${articleUrls}
       for (const n of names) { const t = 'ag_' + rid(24); agents[n] = t; await dir.addAgent(c.id, n, await sha(t)); }
       return json({ ...c, agents, url: `${url.origin}/c/${c.id}`, llms: `${url.origin}/c/${c.id}/llms.txt` });
     }
+    if (m === 'GET' && p === '/admin/stats') { // private boards never appear in /conversations, not even for admin: this is the only view of who uses the site
+      if (!admin) return json({ error: 'admin key required' }, 401);
+      return json(await dir.stats(), 200, NOSTORE); // metadata only; message text stays in the Board objects
+    }
     if (m === 'POST' && p === '/admin/hide') { // site admin takes a board off the air; owner cannot undo
       if (!admin) return json({ error: 'admin key required' }, 401);
       const b = await body();
@@ -181,16 +186,23 @@ ${articleUrls}
       return json({ id: b.id, visibility: 'hidden' });
     }
 
-    const mm = p.match(/^\/c\/([a-f0-9]{16})\/?([a-z.]+)?$/);
-    if (!mm) return json({ error: 'not found' }, 404);
-    const id = mm[1], sub = mm[2] ? '/' + mm[2] : '';
+    const gm = p.match(/^\/c\/([a-f0-9]{16})\/go\/(ag_[0-9a-f]{48})$/); // URL fallback: the token rides in the path, where URL cleaners leave it alone
+    const mm = gm ? null : p.match(/^\/c\/([a-f0-9]{16})\/?([a-z.]+)?$/);
+    if (!gm && !mm) return json({ error: 'not found' }, 404);
+    const id = gm ? gm[1] : mm[1], sub = gm ? '/go' : (mm[2] ? '/' + mm[2] : '');
     const conv = await dir.getConv(id);
     if (!conv) return json({ error: 'no such conversation' }, 404);
     const owner = !!user && user.id === conv.owner;
-    const me = keyHash ? await dir.agentByKey(id, keyHash) : null; // agent name bound to this token, if any
+    const lk = gm ? gm[2] : (q.get('key') || ''); // link.txt takes the token in the query; every verb takes it in the path
+    const linkMe = TOK.test(lk) ? await dir.agentByKey(id, await sha(lk)) : null; // same token, same binding: only the channel differs
+    const me = (keyHash ? await dir.agentByKey(id, keyHash) : null) || linkMe; // agent name bound to this token, if any
     if (conv.visibility === 'hidden' && !admin) return sub === '' ? page('/c', { noindex: true }) : json({ error: 'this conversation was removed' }, 410);
     // llms.txt holds no secrets and agents often fetch it with tools that cannot send headers: always readable
     if (m === 'GET' && sub === '/llms.txt') return new Response(llmsTxt.replaceAll('{BASE}', `${url.origin}/c/${id}`).replaceAll('{TITLE}', conv.title), { headers: { 'content-type': 'text/plain', 'x-robots-tag': 'noindex' } });
+    if (m === 'GET' && sub === '/link.txt') { // the sandbox agent's whole manual, with its own addresses already built
+      if (!linkMe) return json({ error: 'add ?key=<your agent token> to this address' }, 403, NOSTORE);
+      return text(linkTxt.replaceAll('{GO}', `${url.origin}/c/${id}/go/${lk}`).replaceAll('{TITLE}', conv.title).replaceAll('{SLOT}', linkMe), 'text/plain; charset=utf-8', NOSTORE);
+    }
     if (conv.visibility === 'private' && !owner && !me) {
       if (m === 'GET' && sub === '') return page('/c', { noindex: true }); // page loads, then /info tells it the board is private
       return json({ error: 'private conversation, key required' }, 403);
@@ -205,9 +217,61 @@ ${articleUrls}
     if (m === 'GET' && sub === '/wait') {
       const agent = me || q.get('agent');
       if (!agent) return json({ error: 'agent required' }, 400);
-      const r = await board.wait(agent, since);
+      const r = await board.wait(agent, since, q.get('status') === '1');
       return r ? json(r) : json({ error: `too many open waits on this board (max ${LIMITS.waitersPerBoard}); retry in a few seconds` }, 429);
     }
+    // The URL fallback. One GET surface for an agent in a sandbox that can only open addresses: no POST, no headers.
+    // Every answer is short and carries the next addresses, because such a tool often summarises the body instead of returning it.
+    if (sub === '/go') {
+      if (!linkMe) return json({ error: 'this token is not valid for this board' }, 403, NOSTORE);
+      const go = `${url.origin}/c/${id}/go/${lk}`;
+      const nxt = n => ({ read: `${go}?do=read&since=${n}`, send: `${go}?do=msg&since=${n}&text=YOUR_TEXT` });
+      const verb = q.get('do') || 'read';
+      const names = () => dir.names(id);
+      if (verb === 'read') {
+        const all = await board.messages(since);
+        await board.seen(linkMe); // opening an address counts as presence, the same as a wait
+        const nm = await names(), shown = all.slice(-LIMITS.linkRead);
+        const top = shown.length ? shown[shown.length - 1].id : since;
+        return json({ ...nxt(top), messages: shown.map(x => ({ id: x.id, from: nm[x.agent] || x.agent, text: x.text, reply: x.reply })) }, 200, NOSTORE);
+      }
+      if (verb === 'msg') {
+        if (!q.has('since')) return json({ error: 'add &since=N: the highest id you have read, 0 if none', ...nxt(0) }, 400, NOSTORE);
+        const t = q.get('text') || '';
+        if (!t) return json({ error: 'add &text=... with your words', ...nxt(since) }, 400, NOSTORE);
+        if (t.length > LIMITS.linkText) return json({ error: `text over ${LIMITS.linkText} characters; send it in parts`, ...nxt(since) }, 400, NOSTORE);
+        const r = await board.post(linkMe, t, since, q.get('reply') !== 'false', LIMITS.linkDedupeMs);
+        if (r.error) return json({ error: r.error, ...nxt(since) }, r.status, NOSTORE);
+        if (r.conflict) {
+          const top = r.conflict[r.conflict.length - 1].id;
+          return json({ error: `${r.conflict.length} new message(s) came first; open "read", then open "send"`, ...nxt(top) }, 409, NOSTORE);
+        }
+        if (!r.duplicate) await dir.touch(id);
+        return json({ ok: true, id: r.id, ...nxt(r.id), ...(r.duplicate ? { duplicate: true } : {}) }, 200, NOSTORE);
+      }
+      if (verb === 'name') {
+        const name = (q.get('name') || '').trim();
+        if (!/^[A-Za-z0-9][A-Za-z0-9 _.-]{1,19}$/.test(name)) return json({ error: 'name: 2-20 characters, letters, digits, space, _ . -' }, 400, NOSTORE);
+        if (!await dir.setName(id, linkMe, name)) return json({ error: `"${name}" is taken by the other agent; pick another`, ...nxt(since) }, 409, NOSTORE);
+        await board.acted(linkMe);
+        return json({ ok: true, name, ...nxt(since) }, 200, NOSTORE);
+      }
+      if (verb === 'status') {
+        const kind = q.get('kind') || 'working';
+        if (!KINDS.includes(kind)) return json({ error: `kind must be one of ${KINDS.join(', ')}` }, 400, NOSTORE);
+        const until = q.get('until') ? new Date(q.get('until')) : null;
+        if (until && isNaN(until)) return json({ error: 'until must be an ISO 8601 time, for example 2026-09-15T18:00:00Z' }, 400, NOSTORE);
+        if (kind === 'working' && !until) return json({ error: 'a working status needs &until=<ISO 8601 time>: when you expect to be back' }, 400, NOSTORE);
+        const r = await board.status(linkMe, { kind, text: (q.get('text') || '').slice(0, LIMITS.statusText), until: until ? until.toISOString() : null });
+        return r.error ? json({ error: r.error, ...nxt(since) }, r.status, NOSTORE) : json({ ok: true, kind, ...nxt(since) }, 200, NOSTORE);
+      }
+      if (verb === 'agents') {
+        const nm = await names();
+        return json({ ...nxt(since), agents: (await board.agents()).map(a => ({ name: nm[a.agent] || a.agent, seen: a.seen, acted: a.acted, status: a.status, owes_reply: a.owes_reply })) }, 200, NOSTORE);
+      }
+      return json({ error: 'do must be one of read, msg, name, status, agents', ...nxt(since) }, 400, NOSTORE);
+    }
+
     if (m !== 'POST') return json({ error: 'not found' }, 404);
     const b = await body();
 
@@ -244,6 +308,7 @@ ${articleUrls}
       const name = String(b?.name || '').trim();
       if (!/^[A-Za-z0-9][A-Za-z0-9 _.-]{1,19}$/.test(name)) return json({ error: 'name: 2-20 characters, letters, digits, space, _ . -' }, 400);
       if (!await dir.setName(id, me, name)) return json({ error: `"${name}" is taken by the other agent; pick another` }, 409);
+      await board.acted(me);
       return json({ agent: me, name });
     }
     if (sub === '/msg') {
@@ -278,7 +343,7 @@ export class Directory extends DurableObject {
     this.sql.exec('CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY, name TEXT, key_hash TEXT UNIQUE, created TEXT)');
     this.sql.exec('CREATE TABLE IF NOT EXISTS convs(id TEXT PRIMARY KEY, owner TEXT, title TEXT, visibility TEXT, created TEXT, last TEXT, count INTEGER DEFAULT 0)');
     this.sql.exec('CREATE TABLE IF NOT EXISTS agents(conv TEXT, name TEXT, key_hash TEXT UNIQUE, display TEXT, PRIMARY KEY(conv, name))');
-    try { this.sql.exec('ALTER TABLE agents ADD COLUMN display TEXT'); } catch {}
+    try { this.sql.exec('ALTER TABLE agents ADD COLUMN display TEXT'); } catch {} // boards made before this column
     this.sql.exec('CREATE TABLE IF NOT EXISTS limits(k TEXT PRIMARY KEY, start INTEGER, n INTEGER)');
   }
   allow(k, max, windowMs) { // fixed window counter
@@ -295,7 +360,7 @@ export class Directory extends DurableObject {
   }
   addConv(id, owner, title, visibility) {
     const t = now();
-    this.sql.exec('INSERT INTO convs VALUES (?, ?, ?, ?, ?, ?, 0)', id, owner, title, visibility, t, t);
+    this.sql.exec('INSERT INTO convs(id, owner, title, visibility, created, last, count) VALUES (?, ?, ?, ?, ?, ?, 0)', id, owner, title, visibility, t, t);
     return { id, owner, title, visibility, created: t, last: t, count: 0 };
   }
   delConv(id) { this.sql.exec('DELETE FROM convs WHERE id = ?', id); this.sql.exec('DELETE FROM agents WHERE conv = ?', id); }
@@ -322,6 +387,17 @@ export class Directory extends DurableObject {
       uid || '', limit, (p - 1) * limit).toArray();
     return { conversations, total, page: p, pages, limit };
   }
+  stats() { // every user and every board, whatever the visibility; no message text, only what list() would show
+    const users = this.sql.exec(`SELECT u.id, u.name, u.created, COUNT(c.id) AS convs, COALESCE(SUM(c.count), 0) AS msgs
+      FROM users u LEFT JOIN convs c ON c.owner = u.id GROUP BY u.id, u.name, u.created ORDER BY u.created`).toArray();
+    const display = {}; // the name an agent chose is a strong sign that a real agent ran, and it is a label, not content
+    for (const r of this.sql.exec('SELECT conv, name, display FROM agents').toArray()) (display[r.conv] = display[r.conv] || {})[r.name] = r.display || r.name;
+    const conversations = this.sql.exec(`SELECT c.id, c.title, c.visibility, c.created, c.last, c.count, u.name AS owner_name
+      FROM convs c JOIN users u ON u.id = c.owner ORDER BY c.last DESC`).toArray().map(c => ({ ...c, agents: display[c.id] || {} }));
+    const by = { public: 0, private: 0, hidden: 0 };
+    for (const c of conversations) by[c.visibility] = (by[c.visibility] || 0) + 1;
+    return { users: users.length, conversations: conversations.length, messages: conversations.reduce((n, c) => n + c.count, 0), visibility: by, user_list: users, conversation_list: conversations };
+  }
   setVisibility(id, v) { this.sql.exec('UPDATE convs SET visibility = ? WHERE id = ?', v, id); }
   touch(id) { this.sql.exec('UPDATE convs SET last = ?, count = count + 1 WHERE id = ?', now(), id); }
 }
@@ -342,50 +418,66 @@ export class Board extends DurableObject {
     a.push(t); return null;
   }
   messages(since = 0) { return this.sql.exec('SELECT * FROM msgs WHERE id > ? ORDER BY id', since).toArray().map(this.row); }
-  async seen(agent, status) { // presence: last time each agent called, plus its status
-    const a = await this.ctx.storage.get('agents') || {};
-    a[agent] = { seen: now(), status: status === undefined ? a[agent]?.status || null : status };
+  async seen(agent, status, acted) { // presence: last call (seen), last post/status/name (acted), and the status
+    const a = await this.ctx.storage.get('agents') || {}, t = now(), prev = a[agent] || {};
+    a[agent] = { seen: t, acted: acted ? t : prev.acted || null,
+      status: status === undefined ? prev.status || null : status && { ...status, set_at: t } };
     await this.ctx.storage.put('agents', a);
     return a[agent];
   }
+  async acted(agent) { await this.seen(agent, undefined, true); } // a name change is progress too
   async agents() {
     const a = await this.ctx.storage.get('agents') || {};
     const last = this.sql.exec('SELECT agent, reply FROM msgs ORDER BY id DESC LIMIT 1').toArray()[0];
     return Object.entries(a).map(([agent, v]) => {
       let s = typeof v.status === 'string' ? { kind: 'working', text: v.status, until: null } : v.status; // boards from before kinds
       if (s && s.until && Date.parse(s.until) < Date.now()) s = { ...s, expired: true };
-      return { agent, seen: v.seen, status: s, owes_reply: !!last && last.agent !== agent && !!last.reply };
+      return { agent, seen: v.seen, acted: v.acted || null, status: s, owes_reply: !!last && last.agent !== agent && !!last.reply };
     });
   }
-  async status(agent, s) { return this.tooFast(agent) || { agent, ...await this.seen(agent, s) }; }
-  async post(agent, text, since, reply) {
+  async status(agent, s) {
+    const fast = this.tooFast(agent); if (fast) return fast;
+    const v = await this.seen(agent, s, true), ev = { agent, status: v.status };
+    const w = this.waiters; this.waiters = []; // only opt-in waiters (status=1) wake on a status; a status is still not a turn
+    for (const x of w) x.agent !== agent && x.statuses ? x.resolve({ messages: [], status: ev }) : this.waiters.push(x);
+    return { agent, ...v };
+  }
+  async post(agent, text, since, reply, dedupeMs = 0) {
+    if (dedupeMs) { // a GET address can be opened twice by a retry or a cache: the same words twice in a row are a replay, not a message
+      const dup = this.sql.exec('SELECT * FROM msgs WHERE agent = ? AND text = ? AND ts > ? ORDER BY id DESC LIMIT 1',
+        agent, text, new Date(Date.now() - dedupeMs).toISOString()).toArray()[0];
+      if (dup) return { ...this.row(dup), duplicate: true };
+    }
     const fast = this.tooFast(agent); if (fast) return fast;
     const { n, bytes } = this.sql.exec('SELECT COUNT(*) AS n, COALESCE(SUM(LENGTH(text)), 0) AS bytes FROM msgs').one();
     if (n >= LIMITS.msgsPerBoard || bytes >= LIMITS.bytesPerBoard) return { error: 'this board is full; start a new conversation', status: 400 };
-    await this.seen(agent, null); // a real message clears the status
+    await this.seen(agent, null, true); // a real message clears the status
     const conflict = this.sql.exec('SELECT * FROM msgs WHERE id > ? AND agent <> ? ORDER BY id', since, agent).toArray().map(this.row);
     if (conflict.length) return { conflict };
     const ts = now();
     const { id } = this.sql.exec('INSERT INTO msgs(agent, text, ts, reply) VALUES (?, ?, ?, ?) RETURNING id', agent, text, ts, reply ? 1 : 0).one();
     const m = { id, agent, text, ts, reply, redacted: false };
     const w = this.waiters; this.waiters = [];
-    for (const x of w) x.agent === agent ? this.waiters.push(x) : x.resolve([m]);
+    for (const x of w) x.agent === agent ? this.waiters.push(x) : x.resolve(x.statuses ? { messages: [m], status: null } : [m]);
     return m;
   }
   redact(id) {
     const r = this.sql.exec('UPDATE msgs SET text = ?, redacted = 1 WHERE id = ? RETURNING *', '[removed by the board owner]', id).toArray()[0];
     return r ? this.row(r) : null;
   }
-  async wipe() { for (const w of this.waiters) w.resolve([]); this.waiters = []; await this.ctx.storage.deleteAll(); }
-  async wait(agent, since = 0) { // resolves with messages from other agents with id > since; [] after 25s; null when the board has too many open waits
+  async wipe() { for (const w of this.waiters) w.resolve(w.statuses ? { messages: [], status: null } : []); this.waiters = []; await this.ctx.storage.deleteAll(); }
+  // Resolves with messages from other agents with id > since; [] after 25s; null when the board has too many open waits.
+  // statuses = true (opt-in, ?status=1): the answer is { messages, status } and a status change by the other agent also wakes it.
+  async wait(agent, since = 0, statuses = false) {
     await this.seen(agent);
+    const empty = statuses ? { messages: [], status: null } : [];
     const pending = this.sql.exec('SELECT * FROM msgs WHERE id > ? AND agent <> ? ORDER BY id', since, agent).toArray().map(this.row);
-    if (pending.length) return pending;
+    if (pending.length) return statuses ? { messages: pending, status: null } : pending;
     if (this.waiters.length >= LIMITS.waitersPerBoard) return null;
     return new Promise(resolve => {
-      const w = { agent, resolve };
+      const w = { agent, resolve, statuses };
       this.waiters.push(w);
-      setTimeout(() => { this.waiters = this.waiters.filter(x => x !== w); resolve([]); }, 25000);
+      setTimeout(() => { this.waiters = this.waiters.filter(x => x !== w); resolve(empty); }, 25000);
     });
   }
 }

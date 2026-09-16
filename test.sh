@@ -41,10 +41,45 @@ curl -s $U/agents -H "$A1" | grep -q '"expired":true' || fail "until expiry"
 curl -s -o /dev/null -w '%{http_code}' -X POST $U/status -H "$A1" -H "$J" -d "{\"text\":\"$(printf 'x%.0s' $(seq 201))\"}" | grep -q 400 || fail "status limit"
 curl -s -o /dev/null -w '%{http_code}' -X POST $U/status -H "$A1" -H "$J" -d '{"kind":"napping"}' | grep -q 400 || fail "status kind"
 curl -s -o /dev/null -w '%{http_code}' -X POST $U/status -H "$A1" -H "$J" -d '{"kind":"working","text":"no until"}' | grep -q 400 || fail "working without until accepted"
+# progress vs presence: a wait moves "seen" but not "acted"; a status sets acted and set_at
+A1ACT=$(curl -s $U/agents -H "$A1" | j '.find(a=>a.agent=="agent-1").acted'); [ -n "$A1ACT" ] && [ "$A1ACT" != null ] || fail "acted missing"
+curl -s -X POST $U/status -H "$A1" -H "$J" -d '{"kind":"waiting","text":"x"}' | grep -q '"set_at"' || fail "status set_at"
+curl -s "$U/wait?since=99" -H "$A1" -m 2 > /dev/null || true
+curl -s $U/agents -H "$A1" | j '.find(a=>a.agent=="agent-1")' | grep -q "acted" || fail "acted after wait"
+# opt-in status wake: agent-2 waits with status=1, agent-1 posts a status, agent-2 wakes with it (not a list)
+curl -s "$U/wait?since=99&status=1" -H "$A2" > /tmp/ab_s & W=$!; sleep 1
+curl -s -X POST $U/status -H "$A1" -H "$J" -d '{"kind":"working","text":"still on it","until":"2099-01-01T00:00:00Z"}' > /dev/null
+wait $W; grep -q '"status":{"agent":"agent-1"' /tmp/ab_s || fail "status wake: $(cat /tmp/ab_s)"
+grep -q '"messages":\[\]' /tmp/ab_s || fail "status wake shape"
+# a plain wait still sleeps through a status and keeps the list shape
+curl -s "$U/wait?since=99" -H "$A2" -m 4 > /tmp/ab_p & W=$!; sleep 1
+curl -s -X POST $U/status -H "$A1" -H "$J" -d '{"kind":"waiting"}' > /dev/null
+wait $W || true  # curl -m 4 times out on purpose: the plain wait must still be sleeping
+grep -q 'status' /tmp/ab_p && fail "plain wait woke on a status: $(cat /tmp/ab_p)"
 # redact: owner only, mark stays
 curl -s -o /dev/null -w '%{http_code}' -X POST $U/redact -H "$A1" -H "$J" -d '{"id":1}' | grep -q 401 || fail "agent could redact"
 curl -s -X POST $U/redact -H "$O" -H "$J" -d '{"id":1}' | grep -q '"redacted":true' || fail redact
 curl -s $U/messages -H "$A1" | grep -q 'removed by the board owner' || fail "redact mark"
+# URL fallback: the same agent token in the address, for a sandbox that cannot POST. llms.txt points the agent here.
+curl -s $U/llms.txt | grep -q 'link.txt?key=TOKEN' || fail "llms.txt has no fallback"
+FAKE=ag_$(printf '0%.0s' $(seq 48))
+curl -s -o /dev/null -w '%{http_code}' $U/go/$FAKE | grep -q 403 || fail "bad token accepted"
+curl -s -o /dev/null -w '%{http_code}' $U/link.txt | grep -q 403 || fail "link.txt without token"
+G1=$U/go/$T1; G2=$U/go/$T2
+curl -s -o /dev/null -D - "$G1?do=read&since=0" | grep -qi 'cache-control: no-store' || fail "link answer is stored"
+curl -s "$U/link.txt?key=$T1" | grep -q "$G1?do=msg" || fail "link.txt addresses"
+curl -s "$G1?do=read&since=0" | grep -q "\"send\":\"$G1?do=msg" || fail "read gives the next addresses"
+curl -s "$G2?do=name&name=Sandy" | grep -q '"name":"Sandy"' || fail "link name"
+curl -s "$G1?do=msg&since=2&text=hello%20link" | grep -q '"ok":true' || fail "link msg"
+curl -s "$G1?do=msg&since=2&text=hello%20link" | grep -q '"duplicate":true' || fail "link replay posted twice"
+curl -s $U/messages -H "$A1" | grep -q '"text":"hello link"' || fail "link msg text"
+curl -s -o /dev/null -w '%{http_code}' "$G2?do=msg&since=0&text=stale" | grep -q 409 || fail "link stale since accepted"
+curl -s -o /dev/null -w '%{http_code}' "$G1?do=msg&text=nosince" | grep -q 400 || fail "link since not required"
+curl -s -o /dev/null -w '%{http_code}' "$G1?do=msg&since=99&text=$(printf 'x%.0s' $(seq 2001))" | grep -q 400 || fail "link text limit"
+curl -s -o /dev/null -w '%{http_code}' "$G1?do=status&kind=working&text=x" | grep -q 400 || fail "link working without until"
+curl -s "$G1?do=status&kind=blocked&text=asking%20my%20human" | grep -q '"ok":true' || fail "link status"
+curl -s "$G1?do=agents" | grep -q '"name":"Sandy"' || fail "link agents"
+curl -s -o /dev/null -w '%{http_code}' "$G1?do=jump" | grep -q 400 || fail "unknown link verb"
 # share needs a message (this board has 2), then lists; a fresh empty board cannot be shared
 E=$(curl -s -X POST $B/conversations -H "$O" -H "$J" -H "$ADM" -d '{"title":"empty"}' | j .id)
 curl -s -o /dev/null -w '%{http_code}' -X POST $B/c/$E/visibility -H "$O" -H "$J" -d '{"visibility":"public"}' | grep -q 400 || fail "empty board shared"
@@ -58,7 +93,9 @@ curl -s $U/llms.txt | grep -q "$U/msg" || fail llms
 curl -s $U/ | grep -q botcafe || fail "board html"
 curl -s -o /dev/null -w '%{content_type}' $B/c/0000000000000000/messages | grep -q json || fail "404 not json"
 curl -s -o /dev/null -D - $U/ | grep -qi 'x-robots-tag: noindex' || fail "board indexable"
-curl -s $B/robots.txt | grep -q 'Disallow: /c/' || fail robots
+curl -s $B/robots.txt | grep -q 'Disallow: /admin/' || fail robots
+curl -s $B/robots.txt | grep -q 'Disallow: /c/' && fail "robots blocks agents from their own board"
+curl -s -o /dev/null -D - $U/llms.txt | grep -qi 'x-robots-tag: noindex' || fail "llms.txt indexable"
 curl -s $B/sitemap.xml | grep -q 'botcafe.dev/home' || fail sitemap
 curl -s $B/home | grep -qi 'meta name="description"' || fail "home meta"
 curl -s $B/home | grep -qi 'rel="canonical"' || fail "home canonical"
@@ -76,7 +113,9 @@ curl -s $B/sitemap.xml | grep -q 'make-two-ai-agents-talk' || fail "sitemap make
 curl -s $B/home | grep -qi 'botcafe.dev' || fail "home brand"
 curl -s -o /dev/null -D - $B/home | grep -qi 'x-robots-tag: noindex' && fail "home noindex"
 curl -s $B/ | grep -q 'application/ld+json' || fail "json-ld"
+curl -s -o /dev/null -w '%{http_code}' $B/admin/stats | grep -q 401 || fail "stats without admin key"
 if [ -f .admin-key ]; then
+  curl -s $B/admin/stats -H "$ADM" | grep -q '"conversation_list"' || fail "admin stats"
   curl -s -X POST $B/admin/hide -H "authorization: Bearer $(cat .admin-key)" -H "$J" -d "{\"id\":\"$ID\"}" | grep -q hidden || fail "admin hide"
   curl -s -o /dev/null -w '%{http_code}' $U/messages -H "$O" | grep -q 410 || fail "hidden board readable"
 fi
