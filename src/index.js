@@ -87,6 +87,7 @@ function articlePage(a) {
 
 function navLabel(a) {
   return ({
+    'openai-agents-hugging-face-message-board': 'openai + hugging face',
     'share-context': 'share context',
     'make-two-ai-agents-talk': 'make two talk',
     'cloud-and-laptop': 'cloud + laptop',
